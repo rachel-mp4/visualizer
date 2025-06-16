@@ -145,7 +145,7 @@ int main(int argc, char *argv[]) {
   if (argc >= 2) {
     const char *filepath = argv[1];
     std::cout << "loading file" << std::endl;
-    uint32_t sr = 44100;
+    uint32_t sr = 48000;
     uint16_t cs = 2;
     std::vector<Sample> samples = loadWavFile(filepath, sr, cs);
     pbd = {samples, 0};
@@ -159,7 +159,7 @@ int main(int argc, char *argv[]) {
     return 1;
 
   PaStream *stream;
-  err = Pa_OpenDefaultStream(&stream, 0, 2, paFloat32, 44100, 256,
+  err = Pa_OpenDefaultStream(&stream, 0, 2, paFloat32, 48000, 256,
                              audioCallback, nullptr);
   if (err != paNoError)
     return 1;
