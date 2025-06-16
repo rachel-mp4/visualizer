@@ -1,6 +1,8 @@
+#include "iirfilter.h"
+#include "noise.h"
 #include "sample.h"
 #include "sample_buffer.h"
-#include <cmath>
+#include "sawwave.h"
 #include <deque>
 #include <iostream>
 #include <portaudio.h>
@@ -40,10 +42,6 @@ std::vector<Sample> loadWavFile(const char *filename, uint32_t &sampleRate,
 #define SAMPLE_RATE 44100
 #define TAU 6.2831855f
 
-static float phaser = 0.0f;
-static float freqr = 439.9f;
-static float phasel = 0.0f;
-static float freql = 440.1f;
 SampleBuffer visBuffer;
 
 bool usingFile = false;
@@ -53,16 +51,10 @@ struct playbackData {
 };
 playbackData pbd;
 
-Sample oscillator() {
-  Sample s = Sample(sinf(TAU * phasel), sinf(TAU * phaser));
-  phaser += freqr / SAMPLE_RATE;
-  if (phaser >= 1.0f)
-    phaser -= 1.0f;
-  phasel += freql / SAMPLE_RATE;
-  if (phasel >= 1.0f)
-    phasel -= 1.0f;
-  return s;
-}
+SawWave wave = SawWave(Sample(440.1, 439.9), SAMPLE_RATE);
+SawWave wave2 = SawWave(Sample(220.4, 218.6), SAMPLE_RATE);
+Noise n = Noise();
+IIRFilter iir = IIRFilter(&wave2, 0.1f);
 
 static int audioCallback(const void *input, void *output,
                          unsigned long framesPerBuffer,
@@ -77,7 +69,7 @@ static int audioCallback(const void *input, void *output,
         pbd.frameIndex += 1;
       }
     } else {
-      s = s + oscillator() * AMPLITUDE;
+      s = s + (iir.NextSample()) * AMPLITUDE;
     }
     visBuffer.push(s);
     *out++ = s.left;
@@ -130,9 +122,9 @@ void vwindow(SampleBuffer &vb) {
     DrawLineEx(tr, br, 1.0f, fg);
     DrawLineEx(br, bl, 1.0f, fg);
     DrawLineEx(bl, tl, 1.0f, fg);
-    float len = 700 - MeasureTextEx(inter, "analord_11", 32.0f, 0.0f).x;
-    DrawTextEx(inter, "analord_11", {len, 68}, 32.0f, 0.0f, fg);
-    DrawTextPro(interItalic, "afx", {68, 700}, {0, 0}, -90, 32.0f, 0.0f, fg);
+    float len = 700 - MeasureTextEx(inter, "", 32.0f, 0.0f).x;
+    DrawTextEx(inter, "", {len, 68}, 32.0f, 0.0f, fg);
+    DrawTextPro(interItalic, "", {68, 700}, {0, 0}, -90, 32.0f, 0.0f, fg);
 
     for (int i = resampled.size() - 1; i > 0; i--) {
       Sample r1 = resampled[i];
