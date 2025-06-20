@@ -1,12 +1,22 @@
+#include "kiss_fft.h"
 #include "sample.h"
 #include "sample_buffer.h"
 #include <deque>
 #include <iostream>
+#include <limits>
 #include <portaudio.h>
 #include <raylib.h>
 #include <sys/_types/_u_int32_t.h>
+#include <vector>
 #define DR_WAV_IMPLEMENTATION
 #include "dr_wav.h"
+
+#define fftsize 8192
+kiss_fft_cfg cfg = kiss_fft_alloc(fftsize, 0, NULL, NULL);
+kiss_fft_cpx in[fftsize], out[fftsize];
+float audioBuffer[fftsize];
+
+std::vector<float> hannWindow(fftsize);
 
 // loads the wav file!
 std::vector<Sample> loadWavFile(const char *filename, uint32_t &sampleRate,
@@ -63,6 +73,117 @@ static int audioCallback(const void *input, void *output,
   return paContinue;
 }
 
+std::tuple<float, float> fftt(float cents) {
+  const float b1 = 7.0f;
+  const float b2 = 4.0f;
+  float norm_sq = b1 * b1 + b2 * b2; // squared length of basis vector
+  float proj = (cents * b1 + cents * b2) / norm_sq;
+  int i_est = round((proj * b1) / (b1 * b1));
+  int j_est = round((proj * b2) / (b2 * b2));
+  float best_error = std::numeric_limits<float>::max();
+  int best_i = 0, best_j = 0;
+  for (int di = -1; di <= 1; ++di) {
+    for (int dj = -1; dj <= 1; ++dj) {
+      int i = i_est + di;
+      int j = j_est + dj;
+      float approx = i * b1 + j * b2;
+      float error = fabs(cents - approx);
+      if (error < best_error) {
+        best_error = error;
+        best_i = i;
+        best_j = j;
+      }
+    }
+  }
+  return std::make_tuple(best_i, best_j);
+}
+
+std::vector<std::tuple<int, int>> notes(float freq) {
+  std::vector<std::tuple<int, int>> result =
+      std::vector<std::tuple<int, int>>(5);
+  float val = log2(freq / 13.75f);
+  for (int i = 0; i < 5; i++) {
+    int amt = floor(val);
+    switch (amt) {
+    case 0:
+      result[i] = std::make_tuple(0, 0);
+      break;
+    case 1:
+      result[i] = std::make_tuple(1, -2);
+      break;
+    case 2:
+      result[i] = std::make_tuple(-1, -1);
+      break;
+    case 3:
+      result[i] = std::make_tuple(0, 1);
+      break;
+    case 4:
+      result[i] = std::make_tuple(1, -1);
+      break;
+    case 5:
+      result[i] = std::make_tuple(-1, 0);
+      break;
+    case 6:
+      result[i] = std::make_tuple(0, -2);
+      break;
+    case 7:
+      result[i] = std::make_tuple(1, 0);
+      break;
+    case 8:
+      result[i] = std::make_tuple(-1, -1);
+      break;
+    case 9:
+      result[i] = std::make_tuple(0, -1);
+      break;
+    case 10:
+      result[i] = std::make_tuple(1, 1);
+      break;
+    case 11:
+      result[i] = std::make_tuple(-1, 2);
+      break;
+    default:
+      result[i] = std::make_tuple(0, 0);
+    }
+    val -= amt;
+    val = val * 12.0f;
+  }
+  return result;
+}
+
+Sample nptsl(std::tuple<int, int> np) {
+  return Sample(std::get<0>(np) + std::get<1>(np) * .5f,
+                std::get<1>(np) * .866);
+}
+
+Vector2 getPosOfNote(std::vector<std::tuple<int, int>> note) {
+  Sample n0 = 4.0f * nptsl(note[0]) * 3.0f * 3.0f * 3.0f;
+  Sample n1 = 4.0f * nptsl(note[1]) * 3.0f * 3.0f;
+  Sample n2 = 4.0f * nptsl(note[2]) * 3.0f;
+  Sample n3 = 4.0f * nptsl(note[3]);
+  Sample n4 = 4.0f * nptsl(note[3]) / 3.0f;
+  return {400 + (n0 + n1 + n2 + n3 + n4).left,
+          400 + (n0 + n1 + n2 + n3 + n4).right};
+}
+
+std::tuple<float, float> frequencyToTonnetz(float frequency) {
+  int best_i = 0, best_j = 0;
+  float best_error = std::numeric_limits<float>::max();
+
+  for (int i = -500; i <= 500; ++i) {
+    for (int j = -500; j <= 500; ++j) {
+      float approx = i * 7.0f + j * 4.0f;
+      float error = fabs(frequency - approx);
+      if (error < best_error) {
+        best_error = error;
+        best_i = i;
+        best_j = j;
+      }
+    }
+  }
+
+  return std::make_tuple(best_i, best_j);
+}
+
 // everything visual
 void vwindow(SampleBuffer &vb) {
   const int screenwidth = 800;
@@ -80,6 +201,7 @@ void vwindow(SampleBuffer &vb) {
   // #aesthetic, so we want to smooth out the samples so that it needs to spend
   // some time at the very positive and very negative points before it will get
   // pulled in that way, minimizing the amount it passes through the origin!
+  std::deque<Sample> unsmoothed(8192, Sample(0.0));
   std::deque<Sample> smoothed(1600, Sample(0.0));
   std::deque<Sample> resampled(800, Sample(0.0));
   float alpha =
@@ -91,13 +213,17 @@ void vwindow(SampleBuffer &vb) {
                     // becomes the average of maxinresample points
   int ninresample = 0; // how many are currently added to our curresample buffer
   int maxinresample = 4; // how many points get resampled. PLAY WITH IT!
+  float frequency = 1.0f;
 
   while (!WindowShouldClose()) {
+    frequency += 1.0f;
 
     // this is the smearing logic, you can totally mess with this!
-    Sample out;
-    while (vb.pop(out)) {
-      last = out * alpha + last * (1.0f - alpha);
+    Sample outs;
+    while (vb.pop(outs)) {
+      unsmoothed.pop_front();
+      unsmoothed.push_back(last);
+      last = outs * alpha + last * (1.0f - alpha);
       smoothed.pop_front();
       smoothed.push_back(last);
       curresample = curresample + last / maxinresample;
@@ -109,6 +235,12 @@ void vwindow(SampleBuffer &vb) {
         ninresample = 0;
       }
     }
+    auto it = unsmoothed.end() - fftsize;
+    for (int i = 0; i < fftsize; i++, it++) {
+      in[i].r = .5f * (it->left + it->right) * hannWindow[i];
+      in[i].i = 0.0f;
+    }
+    kiss_fft(cfg, in, out);
 
     // of course, here is where the actual drawing happens!
     // look up the raylib's cheatsheet for anything more complex!
@@ -124,18 +256,33 @@ void vwindow(SampleBuffer &vb) {
     DrawLineEx(br, bl, 1.0f, fg);
     DrawLineEx(bl, tl, 1.0f, fg);
 
-    for (int i = resampled.size() - 1; i > 0; i--) {
-      Sample r1 = resampled[i] * 2.0f;
-      r1 = Sample(2 * r1.left - 2 * r1.right, r1.left + r1.right);
-      Sample r2 = resampled[i - 1] * 2.0f;
-      r2 = Sample(2 * r2.left - 2 * r2.right, r2.left + r2.right);
-      Sample s1 = screenheight * (r1 / 2.0f + Sample(0.5f));
-      Vector2 v1 = {s1.left, s1.right};
-      Sample s2 = screenheight * (r2 / 2.0f + Sample(0.5f));
-      Vector2 v2 = {s2.left, s2.right};
-      float f = 1.0f - ((float)i / resampled.size());
-      DrawLineEx(v1, v2, 1.0f, fg);
+    // for (int i = resampled.size() - 1; i > 0; i--) {
+    //   Sample r1 = resampled[i] * 2.0f;
+    //   r1 = Sample(2 * r1.left - 2 * r1.right, r1.left + r1.right);
+    //   Sample r2 = resampled[i - 1] * 2.0f;
+    //   r2 = Sample(2 * r2.left - 2 * r2.right, r2.left + r2.right);
+    //   Sample s1 = screenheight * (r1 / 2.0f + Sample(0.5f));
+    //   Vector2 v1 = {s1.left, s1.right};
+    //   Sample s2 = screenheight * (r2 / 2.0f + Sample(0.5f));
+    //   Vector2 v2 = {s2.left, s2.right};
+    //   float f = 1.0f - ((float)i / resampled.size());
+    //   DrawLineEx(v1, v2, 1.0f, fg);
+    // }
+    for (int i = 1; i < fftsize / 2; i++) {
+      float real = out[i].r;
+      float im = out[i].i;
+      float mag = sqrt(real * real + im * im);
+      if (mag < 1e-4f)
+        continue;
+      float freq = (i * 44800.0f) / fftsize;
+      Vector2 base = getPosOfNote(notes(freq));
+      DrawCircleV(base, logf(mag + 1.0f) * 6.0f, fg);
     }
+    // Vector2 base = getPosOfNote(notes(frequency));
+    // Vector2 point = {base.x + 400.0f, base.y + 400.0f};
+    // Vector2 point2 = {base.x + 405.0f, base.y + 405.0f};
+    // DrawLineEx(point, point2, 5.0f, fg);
+
     EndDrawing();
   }
   CloseWindow();
@@ -151,6 +298,10 @@ int main(int argc, char *argv[]) {
     pbd = {samples, 0};
   } else {
     return 0;
+  }
+
+  for (int i = 0; i < fftsize; i++) {
+    hannWindow[i] = 0.5f * (1.0f - cosf(2.0f * M_PI * i / (fftsize - 1)));
   }
 
   PaError err;

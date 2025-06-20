@@ -1,6 +1,6 @@
 TARGET = synthd
 
-SRCS = main.cpp sample.cpp sample_buffer.cpp
+SRCS = main.cpp sample.cpp sample_buffer.cpp kiss_fft.c
 
 CXX = g++
 
